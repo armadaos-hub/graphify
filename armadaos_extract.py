@@ -38,7 +38,7 @@ from graphify.cluster import cluster, score_all
 from graphify.analyze import god_nodes, surprising_connections, suggest_questions, graph_diff
 from graphify.report import generate as generate_report
 from graphify.export import to_json
-from graphify.cache import file_hash, load_cached, save_cached, cache_dir
+from graphify.cache import file_hash, load_cached, save_cached, save_semantic_cache, cache_dir
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -61,6 +61,19 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("armadaos_extract")
+
+# Dedicated error logger — writes permanently failed chunks to graph_errors.log
+_error_log: logging.Logger | None = None
+
+
+def _init_error_log(output_dir: Path) -> None:
+    """Initialize a dedicated file handler for graph_errors.log."""
+    global _error_log
+    _error_log = logging.getLogger("armadaos_extract.errors")
+    _error_log.setLevel(logging.ERROR)
+    fh = logging.FileHandler(output_dir / "graph_errors.log", mode="w")
+    fh.setFormatter(logging.Formatter("%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    _error_log.addHandler(fh)
 
 # ---------------------------------------------------------------------------
 # Extraction prompt
@@ -153,8 +166,12 @@ async def extract_chunk(
             )
             await asyncio.sleep(wait)
 
-    log.error("Chunk %d permanently failed after %d attempts", chunk_idx, MAX_RETRIES)
-    return {"nodes": [], "edges": [], "input_tokens": 0, "output_tokens": 0, "failed": True}
+    file_list = ", ".join(str(f.name) for f in files)
+    msg = f"Chunk {chunk_idx} permanently failed after {MAX_RETRIES} attempts. Files: {file_list}"
+    log.error(msg)
+    if _error_log:
+        _error_log.error(msg)
+    return {"nodes": [], "edges": [], "input_tokens": 0, "output_tokens": 0, "failed": True, "failed_files": [str(f) for f in files]}
 
 
 async def label_community(
@@ -194,6 +211,7 @@ async def run(repo_path: Path, output_dir: Path) -> None:
 
     client = AsyncOpenAI()
     output_dir.mkdir(parents=True, exist_ok=True)
+    _init_error_log(output_dir)
 
     # ------------------------------------------------------------------
     # Step 1: Detect files
@@ -280,20 +298,33 @@ async def run(repo_path: Path, output_dir: Path) -> None:
         results = await asyncio.gather(*tasks)
         elapsed = time.monotonic() - start
 
+        all_failed_files: list[str] = []
         for i, result in enumerate(results):
             if result.get("failed"):
                 failed_chunks += 1
+                all_failed_files.extend(result.get("failed_files", []))
                 continue
             total_input_tokens += result.get("input_tokens", 0)
             total_output_tokens += result.get("output_tokens", 0)
-            new_nodes.extend(result.get("nodes", []))
-            new_edges.extend(result.get("edges", []))
+            chunk_nodes = result.get("nodes", [])
+            chunk_edges = result.get("edges", [])
+            new_nodes.extend(chunk_nodes)
+            new_edges.extend(chunk_edges)
 
-            # Save to cache per-chunk (associate with the files in that chunk)
+            # True per-file caching: group nodes/edges by source_file
+            # so each file's cache entry contains only ITS OWN extractions
             chunk_files = chunks[i]
+            saved = save_semantic_cache(
+                chunk_nodes, chunk_edges, None, root=cache_root
+            )
+            # For files that produced no nodes/edges, save an empty entry
+            # so they are not re-extracted on the next run
+            cached_source_files = {n.get("source_file", "") for n in chunk_nodes}
+            cached_source_files |= {e.get("source_file", "") for e in chunk_edges}
             for f in chunk_files:
-                # Save a per-file cache entry with the chunk's extraction
-                save_cached(f, result, root=cache_root)
+                rel = str(f.relative_to(repo_path))
+                if rel not in cached_source_files:
+                    save_cached(f, {"nodes": [], "edges": []}, root=cache_root)
 
         failure_rate = failed_chunks / total_chunks if total_chunks > 0 else 0
         log.info(
