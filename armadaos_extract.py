@@ -220,27 +220,41 @@ async def run(repo_path: Path, output_dir: Path) -> None:
     detection = detect(repo_path)
     doc_files_raw: list[str] = detection.get("files", {}).get("document", [])
 
-    # Filter out excluded dirs and oversized files
+    # Filter out excluded dirs, missing files, and oversized files
     doc_files: list[Path] = []
     skipped_large = 0
     skipped_dir = 0
+    skipped_missing = 0
     for fp in doc_files_raw:
         p = Path(fp)
-        parts = set(p.relative_to(repo_path).parts)
+        # Skip files that don't exist (broken symlinks, stale references)
+        if not p.exists():
+            skipped_missing += 1
+            continue
+        try:
+            parts = set(p.relative_to(repo_path).parts)
+        except ValueError:
+            skipped_missing += 1
+            continue
         if parts & EXCLUDE_DIRS:
             skipped_dir += 1
             continue
-        if p.stat().st_size > MAX_FILE_BYTES:
-            skipped_large += 1
+        try:
+            if p.stat().st_size > MAX_FILE_BYTES:
+                skipped_large += 1
+                continue
+        except OSError:
+            skipped_missing += 1
             continue
         doc_files.append(p)
 
     log.info(
-        "Found %d document files (%d skipped: %d excluded dirs, %d oversized)",
+        "Found %d document files (%d skipped: %d excluded dirs, %d oversized, %d missing/broken)",
         len(doc_files),
-        skipped_dir + skipped_large,
+        skipped_dir + skipped_large + skipped_missing,
         skipped_dir,
         skipped_large,
+        skipped_missing,
     )
 
     # ------------------------------------------------------------------
