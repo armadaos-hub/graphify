@@ -44,14 +44,14 @@ from graphify.cache import file_hash, load_cached, save_cached, save_semantic_ca
 # Configuration
 # ---------------------------------------------------------------------------
 
-MAX_CONCURRENCY = int(os.environ.get("GRAPHIFY_MAX_CONCURRENCY", "50"))
+MAX_CONCURRENCY = int(os.environ.get("GRAPHIFY_MAX_CONCURRENCY", "5"))
 MODEL = os.environ.get("GRAPHIFY_MODEL", "gpt-4.1-mini")
 LABEL_MODEL = os.environ.get("GRAPHIFY_LABEL_MODEL", "gpt-4.1-nano")
 CHUNK_SIZE = 15
 MAX_FILE_CHARS = 8000
 MAX_FILE_BYTES = 100 * 1024  # 100 KB — skip files larger than this
 FAILURE_THRESHOLD = 0.50  # Abort if > 50% of chunks fail
-MAX_RETRIES = 3
+MAX_RETRIES = 8  # More retries with rate-limit-aware backoff
 
 EXCLUDE_DIRS = {".git", "node_modules", ".graphify_cache", "__pycache__"}
 
@@ -156,11 +156,22 @@ async def extract_chunk(
             return result
 
         except Exception as exc:
-            wait = 2 ** attempt
+            # Parse rate-limit retry-after if available
+            wait = 2 ** attempt  # default exponential backoff
+            exc_str = str(exc)
+            if "429" in exc_str or "rate_limit" in exc_str:
+                # Try to extract the suggested wait time from the error
+                import re
+                retry_match = re.search(r"try again in ([\d.]+)s", exc_str)
+                if retry_match:
+                    wait = max(float(retry_match.group(1)) + 1.0, wait)
+                else:
+                    wait = max(30, wait)  # Conservative 30s for rate limits
             log.warning(
-                "Chunk %d attempt %d failed: %s — retrying in %ds",
+                "Chunk %d attempt %d/%d failed: %s — retrying in %.1fs",
                 chunk_idx,
                 attempt,
+                MAX_RETRIES,
                 exc,
                 wait,
             )
