@@ -388,6 +388,21 @@ async def run(repo_path: Path, output_dir: Path) -> None:
     merged = {"nodes": deduped_nodes, "edges": all_edges}
     log.info("Merged: %d unique nodes, %d edges", len(deduped_nodes), len(all_edges))
 
+    # Sanitize: LLM sometimes returns list instead of string for fields
+    sanitized = 0
+    for node in merged["nodes"]:
+        for key in ("id", "label", "file_type", "source_file"):
+            if key in node and isinstance(node[key], list):
+                node[key] = str(node[key][0]) if node[key] else ""
+                sanitized += 1
+    for edge in merged["edges"]:
+        for key in ("source", "target", "relation", "confidence", "source_file"):
+            if key in edge and isinstance(edge[key], list):
+                edge[key] = str(edge[key][0]) if edge[key] else ""
+                sanitized += 1
+    if sanitized:
+        log.warning("Sanitized %d list-type fields in extraction data", sanitized)
+
     # ------------------------------------------------------------------
     # Step 5: Build graph, cluster, analyze
     # ------------------------------------------------------------------
